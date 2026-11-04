@@ -237,20 +237,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildResult(ocrText: String): String {
         val norm = normalize(ocrText)
-        val og = bigrams(norm)
-        val scored = bank.map { it to score(it, norm, og) }
-            .filter { it.second >= MIN_SCORE }
+        if (norm.isBlank()) return "没有识别到有效题目文字。请重新拍照或手动输入。"
+
+        // 只从题库检索，不生成、不推理题库之外的答案。
+        val scored = bank.map { item -> item to score(item, norm) }
             .sortedByDescending { it.second }
             .take(3)
+            .filter { it.second >= MIN_SCORE }
 
         val sb = StringBuilder()
         if (scored.isEmpty()) {
-            sb.append("没有找到足够相似的题目。可以在上面的输入框里改一下文字再点搜索。\n\n")
+            sb.append("题库中没有找到足够匹配的题目，因此不提供答案。\n")
+            sb.append("可以检查识别文字，手动修正后再搜索。\n\n")
         } else {
             scored.forEachIndexed { i, (item, s) ->
                 val pct = (s * 100).toInt()
-                sb.append(if (i == 0) "最可能（匹配度 $pct%）\n" else "其他候选（$pct%）\n")
-                sb.append("题目：${item.question}\n答案：${item.answer}\n\n")
+                sb.append(if (i == 0) "题库匹配（匹配度 $pct%）\n" else "相似题目（$pct%）\n")
+                sb.append("题目：${item.question}\n答案：${item.answer.ifBlank { "题库未填写答案" }}\n\n")
             }
         }
         sb.append("—— 识别到的文字 ——\n").append(ocrText.trim())
@@ -258,18 +261,73 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 题库题目的二元组有多少出现在 OCR 文字里（coverage），
-     * 再混入 Dice 系数；题库题目被完整包含时直接给高分。
+     * 题库检索评分：先判断完整包含，再综合题干字符覆盖率、二元组 Dice 和编辑相似度。
+     * OCR 可能同时识别到题号、选项或页面其他文字，因此也在 OCR 文本中寻找近似长度窗口。
      */
-    private fun score(item: Item, norm: String, og: Set<String>): Double {
-        if (item.grams.isEmpty() || og.isEmpty()) return 0.0
-        if (item.norm.length >= 4 && norm.contains(item.norm)) {
-            return 0.9 + 0.1 * item.norm.length / norm.length
+    private fun score(item: Item, ocrNorm: String): Double {
+        val q = item.norm
+        if (q.isEmpty() || ocrNorm.isEmpty()) return 0.0
+        if (ocrNorm.contains(q)) return 1.0
+
+        val qGrams = item.grams
+        val wholeCoverage = qGrams.count { it in bigrams(ocrNorm) }.toDouble() /
+            qGrams.size.coerceAtLeast(1)
+        val wholeDice = dice(qGrams, bigrams(ocrNorm))
+        var best = 0.65 * wholeCoverage + 0.35 * wholeDice
+
+        // 比较题干长度附近的 OCR 子串，避免选项和额外文字稀释相似度。
+        val minLen = (q.length * 0.75).toInt().coerceAtLeast(1)
+        val maxLen = (q.length * 1.25).toInt().coerceAtMost(ocrNorm.length)
+        if (maxLen >= minLen) {
+            val lengthStep = (q.length / 10).coerceAtLeast(1)
+            var len = minLen
+            while (len <= maxLen) {
+                val positionStep = (len / 4).coerceAtLeast(1)
+                var pos = 0
+                while (pos + len <= ocrNorm.length) {
+                    val window = ocrNorm.substring(pos, pos + len)
+                    val wg = bigrams(window)
+                    val coverage = qGrams.count { it in wg }.toDouble() / qGrams.size.coerceAtLeast(1)
+                    val d = dice(qGrams, wg)
+                    // 编辑距离较贵，只对字形/词组覆盖率已经较高的窗口计算。
+                    val edit = if (coverage >= 0.65) editSimilarity(q, window) else 0.0
+                    val candidate = 0.50 * coverage + 0.30 * d + 0.20 * edit
+                    if (candidate > best) best = candidate
+                    pos += positionStep
+                }
+                len += lengthStep
+            }
         }
-        val inter = item.grams.count { it in og }
-        val coverage = inter.toDouble() / item.grams.size
-        val dice = 2.0 * inter / (item.grams.size + og.size)
-        return 0.7 * coverage + 0.3 * dice
+        return best.coerceIn(0.0, 1.0)
+    }
+
+    private fun dice(a: Set<String>, b: Set<String>): Double {
+        if (a.isEmpty() || b.isEmpty()) return 0.0
+        val intersection = a.count { it in b }
+        return 2.0 * intersection / (a.size + b.size)
+    }
+
+    /** Levenshtein 相似度；对较长文本先由窗口限制长度，避免全题 OCR 比较过慢。 */
+    private fun editSimilarity(a: String, b: String): Double {
+        if (a == b) return 1.0
+        if (a.isEmpty() || b.isEmpty()) return 0.0
+        var prev = IntArray(b.length + 1) { it }
+        var curr = IntArray(b.length + 1)
+        for (i in a.indices) {
+            curr[0] = i + 1
+            for (j in b.indices) {
+                val cost = if (a[i] == b[j]) 0 else 1
+                curr[j + 1] = minOf(
+                    curr[j] + 1,
+                    prev[j + 1] + 1,
+                    prev[j] + cost
+                )
+            }
+            val tmp = prev
+            prev = curr
+            curr = tmp
+        }
+        return 1.0 - prev[b.length].toDouble() / max(a.length, b.length)
     }
 
     // ---------- 小工具 ----------
@@ -284,6 +342,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val BANK_FILE = "questions.json"
-        private const val MIN_SCORE = 0.5
+        private const val MIN_SCORE = 0.68
     }
 }
